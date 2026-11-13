@@ -9,12 +9,21 @@ Model, per market, using only the case's own 72h of minute prices:
     h**0.42 (these step/jump series widen slower than a random walk's
     sqrt(h)); the five pooled quantiles, centred on the pooled median,
     give the band offsets at every horizon;
+  * band width adapts to the market's current volatility regime: the mean
+    absolute 1-minute logit move over the last 180 minutes, relative to
+    its full-window average, scales every width by the square root of
+    that ratio (clamped), so a market that has gone quiet gets narrower
+    bands and one that has woken up gets wider ones;
+  * widths also taper gently with horizon (a factor h**-0.04): the pooled
+    bands describe mid horizons best and run slightly wide at 4 hours;
   * the median path starts at the last price and mean-reverts gently
-    toward the mean logit of the last 720 minutes (time constant 1080 min),
-    which prices in the snap-back these markets show after a spike;
-  * offsets are scaled by 0.85 (the raw empirical bands run slightly wide)
-    and the 90% band is floored at 0.008 wide in price space so a market
-    that has never moved still carries a minimal honest spread.
+    toward the trimmed mean logit of the last 720 minutes (time constant
+    1080 min), which prices in the snap-back these markets show after a
+    spike; the trimmed mean keeps one spike inside the window from
+    dragging the target;
+  * inner (25/75%) offsets are scaled by 0.85, the outer (5/95%) ones by
+    0.80, and the 90% band is floored at 0.012 wide in price space so a
+    market that has never moved still carries a minimal honest spread.
 Deterministic: no randomness, no clock, no network. Standard library only.
 """
 
@@ -27,10 +36,17 @@ EPS = 0.0005
 TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
 SAMPLE_H = (1, 2, 3, 5, 8, 12, 20, 30, 45, 60, 90, 120, 180, 240)
 BETA = 0.42        # horizon scaling of standardised changes
-WIDTH = 0.85       # global band width multiplier
+WIDTH = 0.85       # band width multiplier, inner quantiles
+WIDTH_OUT = 0.80   # band width multiplier, outer (5/95%) quantiles
+GAMMA = -0.04      # horizon tilt of band width
+REG_WIN = 180      # minutes in the recent-volatility window
+REG_KAPPA = 0.5    # regime width exponent
+REG_LO = 0.625     # clamp for the regime width factor
+REG_HI = 1.6
 MR_TAU = 1080.0    # mean-reversion time constant, minutes
 MU_WIN = 720       # window for the mean-reversion target, minutes
-FLOOR_W = 0.008    # minimum width of the 90% band, price units
+FLOOR_W = 0.012    # minimum width of the 90% band, price units
+WIDTHS = tuple(WIDTH_OUT if j in (0, 4) else WIDTH for j in range(5))
 
 
 def logit(p):
@@ -57,6 +73,28 @@ def quantile(sorted_vals, tau):
     return sorted_vals[lo] * (1.0 - frac) + sorted_vals[lo + 1] * frac
 
 
+def trimmed_mean(vals):
+    s = sorted(vals)
+    k = len(s) // 10
+    if len(s) - 2 * k > 0:
+        s = s[k:len(s) - k]
+    return sum(s) / len(s)
+
+
+def regime_factor(series):
+    """Width multiplier from the recent vs full-window mean |1-min move|."""
+    n = len(series)
+    if n < 2:
+        return 1.0
+    d = [abs(series[i] - series[i - 1]) for i in range(1, n)]
+    full = sum(d) / len(d)
+    tail = d[-REG_WIN:]
+    recent = sum(tail) / len(tail)
+    if full <= 0.0 or recent <= 0.0:
+        return 1.0
+    return min(REG_HI, max(REG_LO, (recent / full) ** REG_KAPPA))
+
+
 def forecast_market(prices, horizon):
     if not prices:
         return [[0.5] * len(TAUS) for _ in range(horizon)]
@@ -78,16 +116,17 @@ def forecast_market(prices, horizon):
         offs = [0.0] * len(TAUS)
 
     x = series[-1]
-    win = series[-MU_WIN:]
-    mu = sum(win) / len(win)
+    mu = trimmed_mean(series[-MU_WIN:])
     d0 = x - mu
+    wf = regime_factor(series)
 
-    scales = [h ** BETA for h in range(horizon + 1)]
     rows = []
     for h in range(1, horizon + 1):
-        scale = scales[h]
+        scale = h ** BETA
+        tilt = (h ** GAMMA) * wf
         med = x - d0 * (1.0 - math.exp(-h / MR_TAU))
-        row = [sigmoid(med + off * scale * WIDTH) for off in offs]
+        row = [sigmoid(med + off * scale * tilt * w)
+               for off, w in zip(offs, WIDTHS)]
         if row[4] - row[0] < FLOOR_W:
             need = (FLOOR_W - (row[4] - row[0])) / 2.0
             row[0] = max(0.0, row[0] - need)
